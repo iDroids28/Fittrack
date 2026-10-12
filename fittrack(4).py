@@ -35,6 +35,19 @@ EXERCISE_SEED = [
     ("Jumping Jack", "Full body · Cardio", "Beginner", "Bodyweight", "3", "30 sec", "Land softly; use a step-out version for lower impact.", ["Stand tall with arms at your sides.", "Jump feet apart as arms rise overhead.", "Land softly with knees relaxed.", "Return to the start and repeat steadily."]),
 ]
 
+# Exercise choices shown in the routine builder depend on the selected training focus.
+EXERCISE_FOCUS_MAP = {
+    "Full body": ["Barbell Squat", "Push-up", "Dumbbell Row", "Romanian Deadlift", "Plank", "Dumbbell Shoulder Press", "Walking Lunge", "Jumping Jack"],
+    "Strength": ["Barbell Squat", "Romanian Deadlift", "Dumbbell Row", "Dumbbell Shoulder Press", "Push-up"],
+    "Build strength": ["Barbell Squat", "Romanian Deadlift", "Dumbbell Row", "Dumbbell Shoulder Press", "Push-up"],
+    "Build muscle": ["Barbell Squat", "Romanian Deadlift", "Dumbbell Row", "Dumbbell Shoulder Press", "Push-up"],
+    "Cardio": ["Jumping Jack", "Walking Lunge"],
+    "Improve endurance": ["Jumping Jack", "Walking Lunge", "Plank", "Push-up"],
+    "Mobility": ["Walking Lunge", "Plank", "Romanian Deadlift"],
+    "Get moving": ["Jumping Jack", "Walking Lunge", "Push-up", "Plank"],
+    "Stay consistent": ["Push-up", "Walking Lunge", "Plank", "Jumping Jack"],
+}
+
 class FitTrackDB:
     def __init__(self, path: Path = DB_PATH):
         self.conn = sqlite3.connect(path)
@@ -163,10 +176,22 @@ class FitTrackDB:
         self.conn.commit()
 
     def exercises(self, query: str = ""):
+        # The exercise library stays with the original eight exercises. These two
+        # names may remain in an existing database from an earlier version, so
+        # exclude them without deleting anyone's historical workout records.
+        excluded = ("Cat-Cow Stretch", "Hip Flexor Stretch")
         if query:
             term = f"%{query.strip()}%"
-            return self.conn.execute("SELECT * FROM exercises WHERE name LIKE ? OR muscles LIKE ? OR equipment LIKE ? ORDER BY name", (term, term, term)).fetchall()
-        return self.conn.execute("SELECT * FROM exercises ORDER BY name").fetchall()
+            return self.conn.execute(
+                "SELECT * FROM exercises "
+                "WHERE (name LIKE ? OR muscles LIKE ? OR equipment LIKE ?) "
+                "AND name NOT IN (?, ?) ORDER BY name",
+                (term, term, term, *excluded),
+            ).fetchall()
+        return self.conn.execute(
+            "SELECT * FROM exercises WHERE name NOT IN (?, ?) ORDER BY name",
+            excluded,
+        ).fetchall()
 
     def create_routine(self, user_id: int, name: str, focus: str, exercise_ids: list[int]):
         cur = self.conn.execute("INSERT INTO routines(user_id,name,focus,created_at) VALUES(?,?,?,?)", (user_id, name.strip(), focus, datetime.now().date().isoformat()))
@@ -325,7 +350,15 @@ class FitTrackApp(tk.Tk):
         wrap, self.email_entry = self.field(self.auth_card, "EMAIL", self.auth_email)
         wrap.pack(fill="x", pady=(0, 14))
         wrap, self.password_entry = self.field(self.auth_card, "PASSWORD (MIN. 8 CHARACTERS)", self.auth_pass, show="•")
-        wrap.pack(fill="x", pady=(0, 20))
+        wrap.pack(fill="x", pady=(0, 5 if not signup else 20))
+        if not signup:
+            self.show_password_var = tk.BooleanVar(value=False)
+            tk.Checkbutton(
+                self.auth_card, text="Show password", variable=self.show_password_var,
+                command=self._toggle_password_visibility, bg=PANEL, fg=MUTED,
+                activebackground=PANEL, activeforeground=GREEN, selectcolor=PANEL_2,
+                relief="flat", font=("Segoe UI", 9), cursor="hand2"
+            ).pack(anchor="w", pady=(0, 14))
         self.auth_error_label = tk.Label(self.auth_card, text="", bg=PANEL, fg=RED, font=("Segoe UI", 9), wraplength=330, justify="left")
         self.auth_error_label.pack(anchor="w", pady=(0, 7))
         self.button(self.auth_card, "CREATE ACCOUNT" if signup else "LOG IN", self._submit_auth, primary=True).pack(fill="x")
@@ -341,6 +374,11 @@ class FitTrackApp(tk.Tk):
         self.auth_signup = not self.auth_signup
         self._render_auth_card()
 
+    def _toggle_password_visibility(self):
+        """Show or mask the password on the login form."""
+        if hasattr(self, "password_entry") and hasattr(self, "show_password_var"):
+            self.password_entry.configure(show="" if self.show_password_var.get() else "•")
+
     def _submit_auth(self):
         email = self.auth_email.get().strip().lower()
         password = self.auth_pass.get()
@@ -355,7 +393,16 @@ class FitTrackApp(tk.Tk):
             uid = self.db.create_user(email, name, password)
             if not uid:
                 self.auth_error_label.configure(text="That email is already registered. Try logging in."); return
-            self.user = dict(self.db.conn.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone())
+            # Registration creates the account but does not sign the user in.
+            # Return to the login form and require the user to enter their credentials.
+            self.auth_signup = False
+            self._render_auth_card()
+            self.auth_email.set(email)
+            self.auth_error_label.configure(
+                text="Account created successfully. Please log in to continue.", fg=GREEN
+            )
+            self.password_entry.focus_set()
+            return
         else:
             self.user = self.db.verify_user(email, password)
             if not self.user:
@@ -383,11 +430,48 @@ class FitTrackApp(tk.Tk):
         header = tk.Frame(main, bg=BG, padx=25, pady=17); header.pack(fill="x")
         self.breadcrumb = tk.Label(header, text="Workspace  /  Overview", bg=BG, fg=MUTED, font=("Segoe UI", 10)); self.breadcrumb.pack(side="left")
         tk.Label(header, text="●  YOUR FITNESS, IN FOCUS", bg=BG, fg=GREEN, font=("Segoe UI", 8, "bold")).pack(side="right")
-        self.content = tk.Frame(main, bg=BG, padx=25, pady=8); self.content.pack(fill="both", expand=True)
+        # Keep a permanent host for page content. The Overview page uses a
+        # scrollable canvas inside this host; other pages continue to use it directly.
+        self.content_host = tk.Frame(main, bg=BG, padx=25, pady=8)
+        self.content_host.pack(fill="both", expand=True)
+        self.content = self.content_host
+        self.overview_canvas = None
+
+        # Mouse-wheel scrolling is active only while the Overview page is open.
+        self.bind_all("<MouseWheel>", self._on_overview_mousewheel)
+        self.bind_all("<Button-4>", self._on_overview_mousewheel)  # Linux scroll up
+        self.bind_all("<Button-5>", self._on_overview_mousewheel)  # Linux scroll down
         self.show_page("Overview")
 
+    def _on_overview_mousewheel(self, event):
+        """Scroll the Overview with the mouse wheel on Windows, macOS, and Linux."""
+        if (
+            self.page != "Overview"
+            or self.overview_canvas is None
+            or not self.overview_canvas.winfo_exists()
+        ):
+            return None
+
+        if getattr(event, "num", None) == 4:
+            direction = -1
+        elif getattr(event, "num", None) == 5:
+            direction = 1
+        else:
+            delta = getattr(event, "delta", 0)
+            if not delta:
+                return "break"
+            direction = -1 if delta > 0 else 1
+
+        self.overview_canvas.yview_scroll(direction, "units")
+        return "break"
+
     def clear_content(self):
-        for child in self.content.winfo_children(): child.destroy()
+        # Destroy from the host, not from the Overview's inner canvas frame.
+        # This removes the canvas/scrollbar too when navigating to another page.
+        for child in self.content_host.winfo_children():
+            child.destroy()
+        self.content = self.content_host
+        self.overview_canvas = None
 
     def heading(self, eyebrow, title, subtitle=""):
         self.label(self.content, eyebrow.upper(), 8, GREEN, True).pack(anchor="w")
@@ -419,6 +503,31 @@ class FitTrackApp(tk.Tk):
         method()
 
     def page_overview(self):
+        # Build a scrollable area for Overview content while keeping the sidebar
+        # and page header fixed in place.
+        scroll_area = tk.Frame(self.content_host, bg=BG)
+        scroll_area.pack(fill="both", expand=True)
+
+        canvas = tk.Canvas(scroll_area, bg=BG, highlightthickness=0, borderwidth=0)
+        scrollbar = ttk.Scrollbar(scroll_area, orient="vertical", command=canvas.yview)
+        inner = tk.Frame(canvas, bg=BG)
+        window_id = canvas.create_window((0, 0), window=inner, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        inner.bind(
+            "<Configure>",
+            lambda _event: canvas.configure(scrollregion=canvas.bbox("all")),
+        )
+        canvas.bind(
+            "<Configure>",
+            lambda event: canvas.itemconfigure(window_id, width=event.width),
+        )
+
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        self.overview_canvas = canvas
+        self.content = inner
+
         p = self.db.profile(self.user["id"]); stats = self.db.stats(self.user["id"])
         self.heading("Your training space", f"Let's get stronger, {p['display_name']}.", "A little progress today goes a long way. Ready for your next session?")
         hero = tk.Frame(self.content, bg="#1d2a1d", padx=25, pady=20, highlightbackground="#35452e", highlightthickness=1)
@@ -468,11 +577,29 @@ class FitTrackApp(tk.Tk):
         win = tk.Toplevel(self); win.title("Create workout routine"); win.configure(bg=BG); win.geometry("520x680"); win.transient(self); win.grab_set()
         outer = tk.Frame(win, bg=BG, padx=22, pady=18); outer.pack(fill="both", expand=True)
         self.label(outer, "NEW ROUTINE", 9, GREEN, True).pack(anchor="w")
-        name_var = tk.StringVar(value=(preset or {}).get("name", "")); focus_var = tk.StringVar(value=(preset or {}).get("focus", "Full body"))
+        name_var = tk.StringVar(value=(preset or {}).get("name", ""))
+        requested_focus = (preset or {}).get("focus", "Full body")
+        # Keep the original Training Focus choices; recommendation goals are mapped to these.
+        focus_aliases = {
+            "Build strength": "Strength",
+            "Get moving": "Full body",
+            "Stay consistent": "Full body",
+        }
+        original_focuses = ["Full body", "Strength", "Build muscle", "Cardio", "Mobility", "Improve endurance"]
+        if requested_focus not in original_focuses:
+            requested_focus = focus_aliases.get(requested_focus, "Full body")
+        focus_var = tk.StringVar(value=requested_focus)
         wrap, _ = self.field(outer, "ROUTINE NAME", name_var); wrap.pack(fill="x", pady=(14, 12))
         self.label(outer, "TRAINING FOCUS", 9, MUTED, True).pack(anchor="w", pady=(0, 5))
-        ttk.Combobox(outer, textvariable=focus_var, values=["Full body", "Strength", "Build muscle", "Cardio", "Mobility", "Improve endurance"], state="readonly").pack(fill="x", ipady=5)
-        self.label(outer, "SELECT EXERCISES", 9, GREEN, True).pack(anchor="w", pady=(15, 8))
+        focus_box = ttk.Combobox(
+            outer, textvariable=focus_var,
+            values=original_focuses,
+            state="readonly"
+        )
+        focus_box.pack(fill="x", ipady=5)
+        self.button(outer, "↻ Refresh exercises", lambda: refresh_exercises()).pack(anchor="w", pady=(7, 3))
+        self.label(outer, "The list updates when you change the focus or press refresh.", 8, MUTED).pack(anchor="w", pady=(0, 4))
+        self.label(outer, "SELECT EXERCISES", 9, GREEN, True).pack(anchor="w", pady=(8, 8))
         listwrap = tk.Frame(outer, bg=PANEL); listwrap.pack(fill="both", expand=True)
         canvas = tk.Canvas(listwrap, bg=PANEL, highlightthickness=0); sb = ttk.Scrollbar(listwrap, orient="vertical", command=canvas.yview); inner = tk.Frame(canvas, bg=PANEL)
         inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
@@ -480,13 +607,37 @@ class FitTrackApp(tk.Tk):
         canvas.pack(side="left", fill="both", expand=True); sb.pack(side="right", fill="y")
         variables = {}
         preset_names = set((preset or {}).get("exercises", []))
-        for ex in exercises:
-            var = tk.BooleanVar(value=ex["name"] in preset_names)
-            variables[ex["id"]] = var
-            tk.Checkbutton(inner, text=f"{ex['name']}   ·   {ex['muscles']}", variable=var, anchor="w", bg=PANEL, fg=TEXT, activebackground=PANEL, activeforeground=GREEN, selectcolor=PANEL_2, relief="flat", padx=10, pady=8).pack(fill="x")
+
+        def refresh_exercises():
+            # Keep selected exercises that are still relevant to the newly selected focus.
+            if variables:
+                selected_ids = {eid for eid, var in variables.items() if var.get()}
+            else:
+                selected_ids = {ex["id"] for ex in exercises if ex["name"] in preset_names}
+            for child in inner.winfo_children():
+                child.destroy()
+            variables.clear()
+            matching_names = set(EXERCISE_FOCUS_MAP.get(focus_var.get(), EXERCISE_FOCUS_MAP["Full body"]))
+            matching_exercises = [ex for ex in exercises if ex["name"] in matching_names]
+            if not matching_exercises:
+                self.label(inner, "No exercises are available for this focus yet.", 9, MUTED).pack(anchor="w", padx=10, pady=10)
+                return
+            for ex in matching_exercises:
+                var = tk.BooleanVar(value=ex["id"] in selected_ids)
+                variables[ex["id"]] = var
+                tk.Checkbutton(
+                    inner, text=f"{ex['name']}   ·   {ex['muscles']}", variable=var,
+                    anchor="w", bg=PANEL, fg=TEXT, activebackground=PANEL,
+                    activeforeground=GREEN, selectcolor=PANEL_2, relief="flat",
+                    padx=10, pady=8
+                ).pack(fill="x")
+
+        focus_box.bind("<<ComboboxSelected>>", lambda _event: refresh_exercises())
+        refresh_exercises()
+
         def save():
             name = name_var.get().strip(); ids = [eid for eid, v in variables.items() if v.get()]
-            if not name or not ids: messagebox.showwarning("Incomplete routine", "Enter a routine name and select at least one exercise.", parent=win); return
+            if not name or not ids: messagebox.showwarning("Incomplete routine", "Enter a routine name and select at least one matching exercise.", parent=win); return
             self.db.create_routine(self.user["id"], name, focus_var.get(), ids); win.destroy(); self.show_page("Routines")
         self.button(outer, "Save routine", save, primary=True).pack(fill="x", pady=(13, 0))
 
@@ -664,10 +815,7 @@ class FitTrackApp(tk.Tk):
         def render():
             for w in result.winfo_children(): w.destroy()
             g = goal.get()
-            if g == "Improve endurance": names = ["Jumping Jack", "Walking Lunge", "Plank"]
-            elif g == "Build muscle": names = ["Barbell Squat", "Dumbbell Row", "Push-up", "Dumbbell Shoulder Press"]
-            elif g == "Get moving": names = ["Push-up", "Walking Lunge", "Plank"]
-            else: names = ["Barbell Squat", "Romanian Deadlift", "Dumbbell Row", "Push-up"]
+            names = EXERCISE_FOCUS_MAP.get(g, EXERCISE_FOCUS_MAP["Full body"])
             self.label(result, "SUGGESTED STARTER PLAN", 9, GREEN, True).pack(anchor="w", pady=(0, 8))
             for n in names:
                 self.label(result, "•  " + n, 11, TEXT).pack(anchor="w", pady=6)
